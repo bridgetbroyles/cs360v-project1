@@ -79,22 +79,115 @@
 
 void *virtq_gpa_to_hva(const struct virtq_mem *mem, uint64_t gpa, uint64_t len)
 {
-    (void)mem; (void)gpa; (void)len;
+    if (!mem || !mem->regions || len == 0)
+        return NULL;
 
-    /* TODO(student): find the region that fully contains [gpa, gpa+len) and
-     * return the host pointer for it; otherwise return NULL. See the notes
-     * above, and remember what vmm_gpa_to_host() had to guard against. */
+    for (unsigned i = 0; i < mem->nregions; i++) {
+        const struct virtq_mem_region *r = &mem->regions[i];
+
+        if (!r->hva || gpa < r->gpa)
+            continue;
+        uint64_t offset = gpa - r->gpa;
+        if (offset <= r->size && len <= r->size - offset)
+            return r->hva + offset;
+    }
     return NULL;
 }
 
 /* ---- (b) the virtqueue ------------------------------------------------- */
 
+static void append_data(char *rec, uint32_t *rec_len,
+                        const struct virtq_mem *mem,
+                        const struct vring_desc *d)
+{
+    if ((d->flags & VRING_DESC_F_WRITE) || d->len == 0 ||
+        *rec_len == VIRTQ_MAX_RECORD)
+        return;
+
+    const void *src = virtq_gpa_to_hva(mem, d->addr, d->len);
+    if (!src)
+        return;
+
+    uint32_t room = VIRTQ_MAX_RECORD - *rec_len;
+    uint32_t take = d->len < room ? d->len : room;
+    memcpy(rec + *rec_len, src, take);
+    *rec_len += take;
+}
+
+static void walk_indirect(char *rec, uint32_t *rec_len,
+                          const struct virtq_mem *mem,
+                          const struct vring_desc *outer)
+{
+    if (outer->flags & VRING_DESC_F_WRITE)
+        return;
+    if (outer->len == 0 || outer->len % sizeof(struct vring_desc) != 0)
+        return;
+
+    const struct vring_desc *table =
+        virtq_gpa_to_hva(mem, outer->addr, outer->len);
+    if (!table)
+        return;
+
+    uint32_t count = outer->len / sizeof(struct vring_desc);
+    if (count > UINT16_MAX + 1u)
+        count = UINT16_MAX + 1u;
+    uint16_t index = 0;
+    for (uint32_t hops = 0; hops < count; hops++) {
+        if (index >= count)
+            break;
+        struct vring_desc d = table[index];
+
+        /* Indirect tables cannot contain another indirect descriptor. */
+        if (!(d.flags & VRING_DESC_F_INDIRECT))
+            append_data(rec, rec_len, mem, &d);
+        if (!(d.flags & VRING_DESC_F_NEXT))
+            break;
+        index = d.next;
+    }
+}
+
 int vlog_virtq_handle(struct virtq *vq, const struct virtq_mem *mem,
                       struct vlog_sink *sink)
 {
-    (void)vq; (void)mem; (void)sink;
+    if (!vq || !mem || !sink || !vq->desc || !vq->avail || !vq->used ||
+        vq->num == 0)
+        return 0;
 
-    /* TODO(student): process every available chain (see the recipe above) and
-     * return how many you completed. */
-    return 0;
+    uint16_t avail_idx = vq->avail->idx;
+    virtq_rmb();
+    int completed = 0;
+
+    while (vq->last_avail != avail_idx) {
+        uint16_t head = vq->avail->ring[vq->last_avail % vq->num];
+        char rec[VIRTQ_MAX_RECORD];
+        uint32_t rec_len = 0;
+
+        if (head < vq->num) {
+            uint16_t index = head;
+            for (uint32_t hops = 0; hops < vq->num; hops++) {
+                if (index >= vq->num)
+                    break;
+                struct vring_desc d = vq->desc[index];
+
+                if (d.flags & VRING_DESC_F_INDIRECT)
+                    walk_indirect(rec, &rec_len, mem, &d);
+                else
+                    append_data(rec, &rec_len, mem, &d);
+
+                if (!(d.flags & VRING_DESC_F_NEXT))
+                    break;
+                index = d.next;
+            }
+            vlog_sink_emit(sink, rec, rec_len);
+        }
+
+        uint16_t used_idx = vq->used->idx;
+        vq->used->ring[used_idx % vq->num] =
+            (struct vring_used_elem){ .id = head, .len = 0 };
+        virtq_wmb();
+        vq->used->idx = (uint16_t)(used_idx + 1);
+        vq->last_avail++;
+        completed++;
+    }
+    return completed;
 }

@@ -39,19 +39,24 @@ static inline void serial_write(uc_engine *uc, uint64_t offset,
 {
     (void)size;
     struct vmm *v = user_data;
-    (void)v; (void)uc; (void)offset; (void)value;
 
-    /* TODO(student): implement the serial/control protocol (SPEC.md Part I, "Serial / control protocol"):
-     *   - offset SERIAL_TX:       write the low byte of `value` to host stdout.
-     *   - offset SERIAL_POWEROFF: record the exit code (`value`), mark the VM
-     *                             powered off, and stop the CPU (uc_emu_stop).
-     *   - anything else:          ignore. */
+    switch (offset) {
+    case SERIAL_TX:
+        putchar((unsigned char)value);
+        break;
+    case SERIAL_POWEROFF:
+        v->exit_code = (int)value;
+        v->powered_off = 1;
+        uc_emu_stop(uc);
+        break;
+    default:
+        break;
+    }
 }
 
 /* ---- Guest memory faults ---------------------------------------------- */
 
-/* TODO(student): implement the unmapped-memory callback (SPEC.md Part I,
- * "Guest faults"). Unicorn calls it when the guest reads/writes/executes an
+/* Unicorn calls this when the guest reads/writes/executes an
  * address that is not mapped (no RAM, no MMIO region).
  *   - record the fault in the VMM (v->faulted, v->fault_addr);
  *   - report it on stderr (NOT stdout, which is the guest's console);
@@ -61,7 +66,16 @@ static inline void serial_write(uc_engine *uc, uint64_t offset,
 static inline bool mem_invalid(uc_engine *uc, uc_mem_type type, uint64_t address,
                                int size, int64_t value, void *user_data)
 {
-    (void)uc; (void)type; (void)address; (void)size; (void)value; (void)user_data;
+    struct vmm *v = user_data;
+    (void)type;
+    (void)size;
+    (void)value;
+
+    v->faulted = 1;
+    v->fault_addr = address;
+    fprintf(stderr, "guest memory fault at 0x%llx\n",
+            (unsigned long long)address);
+    uc_emu_stop(uc);
     return false;
 }
 
@@ -93,44 +107,77 @@ int vmm_create(struct vmm *v, int trace, const char *log_path)
     uc_err err = uc_open(UC_ARCH_X86, UC_MODE_64, &v->uc);
     if (err) {
         fprintf(stderr, "uc_open: %s\n", uc_strerror(err));
+        logstore_close(v->store);
+        v->store = NULL;
         return -1;
     }
 
-    /* TODO(student): allocate RAM_SIZE bytes of zeroed guest RAM into v->ram,
-     * and map it into the guest at RAM_BASE with uc_mem_map_ptr (host-backed,
-     * UC_PROT_ALL) so the device can translate guest addresses to host
-     * pointers. Return -1 on failure. */
+    v->ram = calloc(1, RAM_SIZE);
+    if (!v->ram) {
+        fprintf(stderr, "out of memory allocating guest RAM\n");
+        vmm_destroy(v);
+        return -1;
+    }
+    err = uc_mem_map_ptr(v->uc, RAM_BASE, RAM_SIZE, UC_PROT_ALL, v->ram);
+    if (err) {
+        fprintf(stderr, "uc_mem_map_ptr: %s\n", uc_strerror(err));
+        vmm_destroy(v);
+        return -1;
+    }
 
-    /* TODO(student): register the serial/control MMIO region at SERIAL_BASE
-     * (size SERIAL_SIZE) with uc_mmio_map, using serial_read / serial_write and
-     * `v` as the user_data for both. */
+    err = uc_mmio_map(v->uc, SERIAL_BASE, SERIAL_SIZE,
+                      serial_read, v, serial_write, v);
+    if (err) {
+        fprintf(stderr, "uc_mmio_map(serial): %s\n", uc_strerror(err));
+        vmm_destroy(v);
+        return -1;
+    }
 
     /* provided: allocate and initialize the device instance (its logic lives
      * in device.c) */
     v->dev = calloc(1, sizeof *v->dev);
     if (!v->dev) {
         fprintf(stderr, "out of memory allocating device\n");
+        vmm_destroy(v);
         return -1;
     }
     vlog_device_init(v->dev, v);
 
-    /* TODO(student): register the logging device's MMIO region at DEV_BASE
-     * (size DEV_SIZE) with uc_mmio_map, using vlog_device_mmio_read /
-     * vlog_device_mmio_write and v->dev as the user_data for both. */
+    err = uc_mmio_map(v->uc, DEV_BASE, DEV_SIZE,
+                      vlog_device_mmio_read, v->dev,
+                      vlog_device_mmio_write, v->dev);
+    if (err) {
+        fprintf(stderr, "uc_mmio_map(device): %s\n", uc_strerror(err));
+        vmm_destroy(v);
+        return -1;
+    }
 
-    /* TODO(student): set the initial stack pointer. RSP goes just below the
-     * reserved boot-info region (BOOTINFO_BASE), 16-byte aligned, via
-     * uc_reg_write(UC_X86_REG_RSP, ...). The guest needs a stack to run. */
+    uint64_t rsp = BOOTINFO_BASE - 16;
+    err = uc_reg_write(v->uc, UC_X86_REG_RSP, &rsp);
+    if (err) {
+        fprintf(stderr, "uc_reg_write(RSP): %s\n", uc_strerror(err));
+        vmm_destroy(v);
+        return -1;
+    }
 
     /* provided: boot-parameter pointer. The guest receives BOOTINFO_BASE in
      * RDI (its main()'s first argument). Leave this as-is. */
     uint64_t rdi = BOOTINFO_BASE;
-    uc_reg_write(v->uc, UC_X86_REG_RDI, &rdi);
+    err = uc_reg_write(v->uc, UC_X86_REG_RDI, &rdi);
+    if (err) {
+        fprintf(stderr, "uc_reg_write(RDI): %s\n", uc_strerror(err));
+        vmm_destroy(v);
+        return -1;
+    }
 
-    /* TODO(student): register mem_invalid() for unmapped accesses with
-     * uc_hook_add(..., UC_HOOK_MEM_UNMAPPED, mem_invalid, v, 1, 0) so a guest
-     * that touches unmapped memory faults cleanly instead of taking the
-     * emulator down with it. */
+    uc_hook h;
+    err = uc_hook_add(v->uc, &h, UC_HOOK_MEM_UNMAPPED,
+                      mem_invalid, v, 1, 0);
+    if (err) {
+        fprintf(stderr, "uc_hook_add(unmapped): %s\n", uc_strerror(err));
+        vmm_destroy(v);
+        return -1;
+    }
 
     /* provided: optional instruction tracing (--trace) */
     if (trace) {
@@ -143,12 +190,42 @@ int vmm_create(struct vmm *v, int trace, const char *log_path)
 
 int vmm_load_binary(struct vmm *v, const char *path)
 {
-    (void)v; (void)path;
-    /* TODO(student): read the whole flat binary at `path` into guest RAM
-     * starting at v->ram (offset 0 == RAM_BASE), rejecting a file larger than
-     * RAM_SIZE, then set the initial RIP to RAM_BASE (the entry point) with
-     * uc_reg_write(UC_X86_REG_RIP, ...). Return 0 on success, -1 on error. */
-    return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        perror("fopen guest binary");
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        perror("fseek guest binary");
+        fclose(f);
+        return -1;
+    }
+    long sz = ftell(f);
+    if (sz < 0 || (uint64_t)sz > RAM_SIZE) {
+        fprintf(stderr, "guest binary too large or unreadable\n");
+        fclose(f);
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        perror("fseek guest binary");
+        fclose(f);
+        return -1;
+    }
+    size_t n = fread(v->ram, 1, (size_t)sz, f);
+    if (n != (size_t)sz || ferror(f)) {
+        fprintf(stderr, "short read loading guest binary\n");
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    uint64_t rip = RAM_BASE;
+    uc_err err = uc_reg_write(v->uc, UC_X86_REG_RIP, &rip);
+    if (err) {
+        fprintf(stderr, "uc_reg_write(RIP): %s\n", uc_strerror(err));
+        return -1;
+    }
+    return 0;
 }
 
 /* provided: boot-parameter blob loader (used by the test harness via
@@ -180,14 +257,15 @@ int vmm_load_bootinfo(struct vmm *v, const char *path)
 
 int vmm_run(struct vmm *v)
 {
-    (void)v;
-    /* TODO(student): start executing the guest from RIP (RAM_BASE) with
-     * uc_emu_start. The guest never returns normally; it stops when the
-     * POWEROFF register is written (your serial_write calls uc_emu_stop).
-     *   - if the guest FAULTED (v->faulted), return VMM_EXIT_FAULT;
-     *   - a Unicorn error while NOT powered off is a failure (return non-zero);
-     *   - otherwise return v->exit_code. */
-    return 1;
+    uc_err err = uc_emu_start(v->uc, RAM_BASE, 0, 0, 0);
+
+    if (v->faulted)
+        return VMM_EXIT_FAULT;
+    if (err && !v->powered_off) {
+        fprintf(stderr, "uc_emu_start: %s\n", uc_strerror(err));
+        return 1;
+    }
+    return v->powered_off ? v->exit_code : 1;
 }
 
 void vmm_destroy(struct vmm *v)
@@ -204,10 +282,11 @@ void vmm_destroy(struct vmm *v)
 
 void *vmm_gpa_to_host(struct vmm *v, uint64_t gpa, uint64_t len)
 {
-    (void)v; (void)gpa; (void)len;
-    /* TODO(student): translate the guest-physical range [gpa, gpa+len) to a
-     * host pointer into v->ram. Return NULL unless the ENTIRE range lies within
-     * guest RAM [RAM_BASE, RAM_BASE + RAM_SIZE). Beware integer overflow when
-     * checking the upper bound. See SPEC.md Part I, vmm_gpa_to_host. */
-    return NULL;
+    uint64_t ram_end = RAM_BASE + RAM_SIZE;
+
+    if (!v || !v->ram || gpa < RAM_BASE || gpa > ram_end)
+        return NULL;
+    if (len > ram_end - gpa)
+        return NULL;
+    return v->ram + (size_t)(gpa - RAM_BASE);
 }
