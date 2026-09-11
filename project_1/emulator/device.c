@@ -31,6 +31,8 @@
 #include "device.h"
 #include "vmm.h"
 
+#include <string.h>
+
 /* ---- Helpers (provided; use if you find them handy) ------------------ */
 
 /* Reassemble the 64-bit guest-physical message address from its two halves. */
@@ -65,6 +67,78 @@ void vlog_device_init(struct vlog_device *dev, struct vmm *vmm)
     dev->bytes       = 0;
 }
 
+/* ---- Commands (SPEC.md §4) -------------------------------------------- */
+
+/* LOG: append the LEN bytes at MSG to the log as one record. Everything is
+ * validated before anything is written, so a failure appends nothing. */
+static void cmd_log(struct vlog_device *dev)
+{
+    if (dev->len > VLOG_MAX_MSG) {
+        set_error(dev, VLOG_ERR_BADLEN);
+        return;
+    }
+
+    /* An empty message is valid, and its address is not examined. */
+    const void *msg = NULL;
+    if (dev->len > 0) {
+        msg = vmm_gpa_to_host(dev->vmm, msg_addr(dev), dev->len);
+        if (msg == NULL) {
+            set_error(dev, VLOG_ERR_BADADDR);
+            return;
+        }
+    }
+
+    /* records are numbered from 0, so log with the current SEQ, then bump it */
+    logstore_append(dev->vmm->store, dev->seq, dev->level, msg, dev->len);
+    dev->seq++;
+    dev->bytes += dev->len;
+}
+
+/* STAT: write the device's counters INTO the guest's buffer at MSG. This is
+ * the one command that writes guest memory, so check the guest really offered
+ * enough room at a real RAM address before writing anything. */
+static void cmd_stat(struct vlog_device *dev)
+{
+    if (dev->len < sizeof(struct vlog_stats)) {
+        set_error(dev, VLOG_ERR_BADLEN);
+        return;
+    }
+
+    void *out = vmm_gpa_to_host(dev->vmm, msg_addr(dev), sizeof(struct vlog_stats));
+    if (out == NULL) {
+        set_error(dev, VLOG_ERR_BADADDR);
+        return;
+    }
+
+    struct vlog_stats stats = { .records = dev->seq, .bytes = dev->bytes };
+    /* memcpy, because the guest's buffer may not be aligned */
+    memcpy(out, &stats, sizeof stats);
+}
+
+static void run_command(struct vlog_device *dev, uint32_t cmd)
+{
+    /* set_error() ORs its code into STATUS, so start every command with the
+     * error cleared. A command that succeeds leaves it that way. */
+    clear_error(dev);
+
+    switch (cmd) {
+    case VLOG_CMD_NOP:
+        break;
+    case VLOG_CMD_LOG:
+        cmd_log(dev);
+        break;
+    case VLOG_CMD_FLUSH:
+        logstore_flush(dev->vmm->store);
+        break;
+    case VLOG_CMD_STAT:
+        cmd_stat(dev);
+        break;
+    default:
+        set_error(dev, VLOG_ERR_BADCMD);
+        break;
+    }
+}
+
 /* ---- Your task: the MMIO handlers ------------------------------------ */
 
 uint64_t vlog_device_mmio_read(uc_engine *uc, uint64_t offset,
@@ -72,12 +146,18 @@ uint64_t vlog_device_mmio_read(uc_engine *uc, uint64_t offset,
 {
     (void)uc; (void)size;
     struct vlog_device *dev = user_data;
-    (void)dev; (void)offset;
 
-    /* TODO(student): return the 32-bit value of the register at `offset`
-     * (relative to DEV_BASE): ID, VERSION, STATUS, MSG_LO, MSG_HI, LEN, LEVEL,
-     * SEQ. Return 0 for any other offset. See SPEC.md §2. */
-    return 0;
+    switch (offset) {
+    case VLOG_REG_ID:      return VLOG_MAGIC;
+    case VLOG_REG_VERSION: return VLOG_VERSION;
+    case VLOG_REG_STATUS:  return dev->status;
+    case VLOG_REG_MSG_LO:  return dev->msg_addr_lo;
+    case VLOG_REG_MSG_HI:  return dev->msg_addr_hi;
+    case VLOG_REG_LEN:     return dev->len;
+    case VLOG_REG_LEVEL:   return dev->level;
+    case VLOG_REG_SEQ:     return dev->seq;
+    default:               return 0; /* CMD is write-only; unknown offsets read 0 */
+    }
 }
 
 void vlog_device_mmio_write(uc_engine *uc, uint64_t offset,
@@ -85,29 +165,14 @@ void vlog_device_mmio_write(uc_engine *uc, uint64_t offset,
 {
     (void)uc; (void)size;
     struct vlog_device *dev = user_data;
-    (void)dev; (void)offset; (void)value;
+    uint32_t value32 = (uint32_t)value; /* all registers are 32-bit */
 
-    /* TODO(student): handle writes by `offset`:
-     *   - operand registers (MSG_LO / MSG_HI / LEN / LEVEL): store the value;
-     *   - CMD: execute the command:
-     *       NOP:   clear any error, do nothing else;
-     *       LOG:   validate LEN (<= VLOG_MAX_MSG) and, if LEN > 0, translate
-     *               [MSG, MSG+LEN) with vmm_gpa_to_host(); then hand the record
-     *               to the store:
-     *                 logstore_append(dev->vmm->store, dev->seq, dev->level,
-     *                                 msg, dev->len);
-     *               and advance dev->seq. On error use set_error() and append
-     *               nothing;
-     *       FLUSH: logstore_flush(dev->vmm->store);
-     *       STAT:  write a `struct vlog_stats` (records + total message bytes
-     *               logged) INTO the guest's buffer at [MSG, MSG+LEN). This is
-     *               the one command that writes to guest memory, so check that
-     *               the guest really offered you enough room (LEN >= the struct,
-     *               else ERR_BADLEN) and that the range is really in guest RAM
-     *               (vmm_gpa_to_host, else ERR_BADADDR) BEFORE you write. It
-     *               does not touch the log or SEQ. Track the byte count in
-     *               dev->bytes as you log;
-     *       other: set_error(VLOG_ERR_BADCMD);
-     *   - read-only registers and unknown offsets: ignore the write.
-     * See SPEC.md §3 (errors) and §4 (commands). */
+    switch (offset) {
+    case VLOG_REG_MSG_LO: dev->msg_addr_lo = value32; break;
+    case VLOG_REG_MSG_HI: dev->msg_addr_hi = value32; break;
+    case VLOG_REG_LEN:    dev->len = value32;         break;
+    case VLOG_REG_LEVEL:  dev->level = value32;       break;
+    case VLOG_REG_CMD:    run_command(dev, value32);  break;
+    default:              break; /* read-only registers and unknown offsets */
+    }
 }
